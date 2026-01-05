@@ -23,7 +23,7 @@ jobs:
       actions: read # for 8398a7/action-slack
     steps:
       - name: Data
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         continue-on-error: true
         id: data
         with:
@@ -44,12 +44,12 @@ jobs:
             }
 
       - name: Send Notification
-        uses: 8398a7/action-slack@1750b5085f3ec60384090fb7c52965ef822e869e # v3.18.0
+        uses: 8398a7/action-slack@77eaa4f1c608a7d68b38af4e3f739dcd8cba273e # v3.19.0
         with:
           status: custom
           custom_payload: |
             {
-              username: 'Github',
+              username: 'GitHub',
               icon_emoji: ':github:',
               mention: 'channel',
               attachments: [{

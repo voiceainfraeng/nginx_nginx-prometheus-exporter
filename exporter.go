@@ -16,7 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	plusclient "github.com/nginx/nginx-plus-go-client/v2/client"
+	plusclient "github.com/nginx/nginx-plus-go-client/v3/client"
 	"github.com/nginx/nginx-prometheus-exporter/client"
 	"github.com/nginx/nginx-prometheus-exporter/collector"
 
@@ -30,6 +30,8 @@ import (
 
 	"github.com/prometheus/exporter-toolkit/web"
 	"github.com/prometheus/exporter-toolkit/web/kingpinflag"
+
+	proxyproto "github.com/pires/go-proxyproto"
 )
 
 // positiveDuration is a wrapper of time.Duration to ensure only positive values are accepted.
@@ -59,7 +61,7 @@ func parsePositiveDuration(s string) (positiveDuration, error) {
 func createPositiveDurationFlag(s kingpin.Settings) (target *time.Duration) {
 	target = new(time.Duration)
 	s.SetValue(&positiveDuration{Duration: *target})
-	return
+	return target
 }
 
 func parseUnixSocketAddress(address string) (string, string, error) {
@@ -90,6 +92,7 @@ var (
 	sslCaCert     = kingpin.Flag("nginx.ssl-ca-cert", "Path to the PEM encoded CA certificate file used to validate the servers SSL certificate.").Default("").Envar("SSL_CA_CERT").String()
 	sslClientCert = kingpin.Flag("nginx.ssl-client-cert", "Path to the PEM encoded client certificate file to use when connecting to the server.").Default("").Envar("SSL_CLIENT_CERT").String()
 	sslClientKey  = kingpin.Flag("nginx.ssl-client-key", "Path to the PEM encoded client certificate key file to use when connecting to the server.").Default("").Envar("SSL_CLIENT_KEY").String()
+	useProxyProto = kingpin.Flag("nginx.proxy-protocol", "Pass proxy protocol payload to nginx listeners.").Default("false").Envar("PROXY_PROTOCOL").Bool()
 
 	// Custom command-line flags.
 	timeout = createPositiveDurationFlag(kingpin.Flag("nginx.timeout", "A timeout for scraping metrics from NGINX or NGINX Plus.").Default("5s").Envar("TIMEOUT").HintOptions("5s", "10s", "30s", "1m", "5m"))
@@ -223,17 +226,68 @@ func main() {
 func registerCollector(logger *slog.Logger, transport *http.Transport,
 	addr string, labels map[string]string,
 ) {
+	var socketPath string
+
 	if strings.HasPrefix(addr, "unix:") {
-		socketPath, requestPath, err := parseUnixSocketAddress(addr)
+		var err error
+		var requestPath string
+		socketPath, requestPath, err = parseUnixSocketAddress(addr)
 		if err != nil {
 			logger.Error("parsing unix domain socket scrape address failed", "uri", addr, "error", err.Error())
 			os.Exit(1)
 		}
-
-		transport.DialContext = func(_ context.Context, _, _ string) (net.Conn, error) {
-			return net.Dial("unix", socketPath)
-		}
 		addr = "http://unix" + requestPath
+	}
+
+	if !*useProxyProto && socketPath != "" {
+		transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			d := &net.Dialer{}
+			return d.DialContext(ctx, "unix", socketPath)
+		}
+	}
+
+	if *useProxyProto {
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if socketPath != "" {
+				network = "unix"
+				addr = socketPath
+			}
+
+			conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, fmt.Errorf("dialing %s %s: %w", network, addr, err)
+			}
+
+			localAddr := conn.LocalAddr()
+			remoteAddr := conn.RemoteAddr()
+			transportProtocol := proxyproto.TCPv4
+
+			switch remoteAddrTyped := remoteAddr.(type) {
+			case *net.TCPAddr:
+				if remoteAddrTyped.IP.To4() == nil {
+					transportProtocol = proxyproto.TCPv6
+				}
+			case *net.UnixAddr:
+				transportProtocol = proxyproto.UnixStream
+			}
+
+			header := &proxyproto.Header{
+				Version:           2,
+				Command:           proxyproto.PROXY,
+				TransportProtocol: transportProtocol,
+				SourceAddr:        localAddr,
+				DestinationAddr:   remoteAddr,
+			}
+
+			// as we do not use any TLVs, header size should be pretty small, hence we only check for error, assuming the whole header went out in a single packet
+			_, err = header.WriteTo(conn)
+			if err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("writing proxyproto header via %s to %s: %w", network, addr, err)
+			}
+
+			return conn, nil
+		}
 	}
 
 	userAgent := fmt.Sprintf("NGINX-Prometheus-Exporter/v%v", common_version.Version)
@@ -292,7 +346,7 @@ func cloneRequest(req *http.Request) *http.Request {
 // addMissingEnvironmentFlags sets Envar on any flag which has
 // the "web." prefix which doesn't already have an Envar set.
 func addMissingEnvironmentFlags(ka *kingpin.Application) {
-	for _, f := range ka.Model().FlagGroupModel.Flags {
+	for _, f := range ka.Model().Flags {
 		if strings.HasPrefix(f.Name, "web.") && f.Envar == "" {
 			retrievedFlag := ka.GetFlag(f.Name)
 			if retrievedFlag != nil {
